@@ -1,0 +1,6 @@
+{
+  "siem-es":     {"base": "https://siem-es.example.com",     "secret": "SIEM_API_KEY", "auth": "ApiKey",   "kind": "es"},
+  "siem-kibana": {"base": "https://siem-kibana.example.com", "secret": "SIEM_API_KEY", "auth": "ApiKey",   "kind": "kibana-getonly"},
+  "edr-prod":    {"base": "https://tenant.example-edr.net",  "secret": "EDR_API_TOKEN", "auth": "ApiToken", "kind": "s1",
+                  "forbidden_sites": {}}
+}

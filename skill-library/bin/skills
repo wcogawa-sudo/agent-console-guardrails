@@ -1,0 +1,541 @@
+#!/usr/bin/env -S python3 -I
+"""skills - find and manage library skills without loading them all into context.
+
+  skills search <query...> [--group G] [-n 5] [--json]   ranked matches, ~60 tokens each
+  skills show <name>                                      print one skill (path + full text)
+  skills list [--group G]                                 one line per skill
+  skills lint                                             check every skill against the template
+  skills new <group> <name>                               start a skill from TEMPLATE.md
+  skills test                                             run the router test cases (tests/)
+
+Common option: --root DIR (default: the library folder this script lives in).
+
+Only the router skill is installed into Claude/pi. Library skills are never listed to the
+model; it runs `search`, reads the one or two that match, and ignores the rest. Stdlib only.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parent.parent
+SKIP_DIRS = {"bin", "tests"}
+REQUIRED = ("name", "description", "domain", "tags", "status", "last_verified")
+STATUSES = {"draft", "reviewed", "deprecated"}
+SECTIONS = ("## When to use", "## Workflow", "## Verification")
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+STALE_DAYS = 180
+MIN_SCORE = 3.0          # below this the best hit is "no match": one stray description word scores ~2.6,
+                         # one name/tag/ATT&CK hit ~3.2+. Re-check with `skills test` as the library grows.
+TOP_K_PASS = 3           # `skills test`: expected skill must be in the top 3
+
+# Fields and how much a query word matching them counts.
+WEIGHTS = {"name": 3.0, "tags": 2.5, "attack": 4.0, "domain": 1.5, "description": 1.0}
+
+# Hosts a skill may link to without a lint warning. Add sources you trust.
+URL_ALLOW = (
+    "attack.mitre.org", "d3fend.mitre.org", "atlas.mitre.org", "github.com/sigmahq",
+    "github.com/mitre", "cisa.gov", "nvd.nist.gov", "nist.gov", "learn.microsoft.com",
+    "elastic.co", "sentinelone.com", "zeek.org", "lolbas-project.github.io",
+    "loldrivers.io", "owasp.org", "wiki.archlinux.org", "learn.omacom.io",
+)
+
+# Text that has no business in a method skill. Warnings, not errors: an offensive-lab skill
+# may legitimately mention some of these. Mostly here to catch borrowed text.
+HYGIENE = [
+    (r"ignore\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+instructions", "prompt-injection phrasing"),
+    (r"(curl|wget)[^\n|]*\|\s*(sudo\s+)?(ba|z)?sh\b", "pipes a download into a shell"),
+    (r"downloadstring|invoke-webrequest[^\n]*\|\s*iex|\biex\s*\(", "PowerShell download-and-run"),
+    (r"\bbws\b|secret-tool|\.ssh/|id_rsa|\bkeyring\b|api[_-]?key\s*[:=]", "touches secrets or keys"),
+    (r"(bypass|disable|skip|turn\s+off)\W+(\w+\W+){0,3}(roq|guard|hook|safety|edr|sentinelone)", "asks to switch off a safeguard"),
+    (r"(do\s+not|don'?t|never)\s+(tell|inform|mention|show)\s+(the\s+)?(user|analyst)", "asks to hide something from the user"),
+    (r"(send|post|upload|exfiltrate)\W+(\w+\W+){0,4}(to\s+)?https?://", "sends data to a URL"),
+]
+
+ATTACK_RE = re.compile(r"^t\d{4}(\.\d{3})?$")
+STOPWORDS = set("""a an and are as at be by can do does for from has have how i if in into is it its
+me my no not of on or our so some that the their there this to too use used using was we what when
+where which who why will with you your about after all also any been before but could did get got
+just like make need only out over should than them then these they up very want would""".split())
+WORD_RE = re.compile(r"[a-z0-9]+(?:\.\d{3})?")
+
+
+# ---------- parsing ----------
+
+class SkillError(Exception):
+    pass
+
+
+def parse_frontmatter(text):
+    """Strict, small subset of YAML: `key: value` or `key: [a, b]`, one line each."""
+    if not text.startswith("---\n"):
+        raise SkillError("file must start with '---' frontmatter")
+    end = text.find("\n---", 4)
+    if end < 0:
+        raise SkillError("frontmatter has no closing '---'")
+    meta = {}
+    for i, line in enumerate(text[4:end].splitlines(), 2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([a-z_]+):\s*(.*)$", line)
+        if not m:
+            raise SkillError(f"frontmatter line {i}: expected 'key: value' on one line")
+        key, val = m.group(1), m.group(2).strip()
+        if val.startswith("["):
+            if not val.endswith("]"):
+                raise SkillError(f"frontmatter line {i}: list must be on one line, e.g. [a, b]")
+            meta[key] = [unquote(x) for x in val[1:-1].split(",") if x.strip()]
+        else:
+            meta[key] = unquote(val)
+    body = text[end + 4:].lstrip("-").lstrip("\n")
+    return meta, body
+
+
+def unquote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+    return s
+
+
+def skill_files(root):
+    for group in sorted(p for p in root.iterdir() if p.is_dir()):
+        if group.name in SKIP_DIRS or group.name[0] in "._":
+            continue
+        for d in sorted(p for p in group.iterdir() if p.is_dir() and p.name[0] not in "._"):
+            f = d / "SKILL.md"
+            if f.is_file():
+                yield group.name, d, f
+
+
+def load_skill(group, d, f, root):
+    meta, body = parse_frontmatter(f.read_text(encoding="utf-8"))
+    as_list = lambda v: v if isinstance(v, list) else ([v] if v else [])
+    return {
+        "name": meta.get("name", ""),
+        "group": group,
+        "folder": d.name,
+        "domain": meta.get("domain", ""),
+        "description": meta.get("description", ""),
+        "tags": as_list(meta.get("tags")),
+        "attack": [a.lower() for a in as_list(meta.get("attack"))],
+        "status": meta.get("status", ""),
+        "last_verified": meta.get("last_verified", ""),
+        "origin": meta.get("origin", ""),
+        "path": str(f.relative_to(root)),
+        "_meta": meta,
+        "_body": body,
+    }
+
+
+# ---------- index (rebuilt automatically when any skill changes) ----------
+
+def fingerprint(root):
+    h = hashlib.sha1(Path(__file__).read_bytes())    # a new version of this tool rebuilds the index
+    for _, _, f in skill_files(root):
+        st = f.stat()
+        h.update(f"{f}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    alias = root / "aliases.tsv"
+    if alias.exists():
+        h.update(f"aliases|{alias.stat().st_mtime_ns}".encode())
+    return h.hexdigest()
+
+
+def build_index(root):
+    skills, broken = [], []
+    for group, d, f in skill_files(root):
+        try:
+            s = load_skill(group, d, f, root)
+        except SkillError as e:
+            broken.append(f"{f.relative_to(root)}: {e}")
+            continue
+        row = {k: v for k, v in s.items() if not k.startswith("_")}
+        hits = hygiene_hits(s["description"] + "\n" + s["_body"])
+        row["quarantined"] = bool(hits) and not s["_meta"].get("hygiene_ok")
+        skills.append(row)
+    return {"generated": dt.datetime.now().isoformat(timespec="seconds"),
+            "fingerprint": fingerprint(root), "skills": skills, "broken": broken}
+
+
+def get_index(root, persist=True):
+    path = root / "index.json"
+    fp = fingerprint(root)
+    if path.exists():
+        try:
+            idx = json.loads(path.read_text())
+            if idx.get("fingerprint") == fp:
+                return idx
+        except (OSError, ValueError):
+            pass
+    idx = build_index(root)
+    if persist:
+        path.write_text(json.dumps(idx, indent=1) + "\n")
+    return idx
+
+
+# ---------- search ----------
+
+def stem(w):
+    if ATTACK_RE.match(w):
+        return w
+    if w.endswith("sses"):
+        w = w[:-2]
+    elif w.endswith("ies") and len(w) > 4:
+        w = w[:-3] + "y"
+    elif w.endswith("es") and re.search(r"(x|ch|sh|ss)es$", w):
+        w = w[:-2]
+    elif w.endswith("s") and not re.search(r"(ss|us|is)$", w) and len(w) > 3:
+        w = w[:-1]
+    for suf in ("ing", "ion", "ed", "er"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            w = w[: -len(suf)]
+            if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "lsz":
+                w = w[:-1]                # dropping -> dropp -> drop
+            return w
+    return w
+
+
+def words(text):
+    return WORD_RE.findall(str(text).lower().replace("_", " ").replace("-", " "))
+
+
+def content_words(text):
+    return [w for w in words(text) if w not in STOPWORDS]
+
+
+def load_aliases(root):
+    out = {}
+    path = root / "aliases.tsv"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if not line.strip() or line.startswith("#") or "\t" not in line:
+                continue
+            k, v = line.split("\t", 1)
+            out[k.strip().lower()] = words(v)
+    return out
+
+
+def doc_terms(s):
+    tf = {}
+    def add(tokens, w):
+        for t in tokens:
+            tf[t] = tf.get(t, 0.0) + w
+    add([stem(w) for w in content_words(s["name"])], WEIGHTS["name"])
+    for t in s["tags"]:
+        parts = content_words(t)
+        if len(parts) == 1:
+            add([stem(parts[0])], WEIGHTS["tags"])
+        elif parts:                       # "red-team": full weight only for the whole phrase,
+            add(["".join(parts)], WEIGHTS["tags"])   # the parts count like description words
+            add([stem(w) for w in parts], WEIGHTS["description"])
+    add([stem(w) for w in content_words(s["domain"])], WEIGHTS["domain"])
+    add([stem(w) for w in content_words(s["description"])], WEIGHTS["description"])
+    ids = set()
+    for a in s["attack"]:
+        ids.add(a)
+        ids.add(a.split(".")[0])          # T1558.003 also answers to T1558
+    add(sorted(ids), WEIGHTS["attack"])
+    return tf
+
+
+def query_terms(query, aliases):
+    raw = words(query)
+    out = []
+    for w in raw:
+        if w not in STOPWORDS:
+            out.append(w)
+        out.extend(x for x in aliases.get(w, []) if x not in STOPWORDS)
+    for a, b in zip(raw, raw[1:]):        # "red team" in a query also matches the tag red-team
+        out.append(a + b)
+    joined = " ".join(raw)
+    for k, v in aliases.items():          # multi-word aliases, e.g. "deep visibility"
+        if " " in k and k in joined:
+            out.extend(x for x in v if x not in STOPWORDS)
+    return sorted({t if t in raw_pairs(raw) else stem(t) for t in out})
+
+
+def raw_pairs(raw):
+    return {a + b for a, b in zip(raw, raw[1:])}
+
+
+def search(idx, query, group=None, n=5, aliases=None, include_deprecated=False):
+    pool = [s for s in idx["skills"]
+            if (group is None or s["group"] == group)
+            and (include_deprecated or s["status"] != "deprecated")
+            and not s.get("quarantined")]
+    if not pool:
+        return []
+    docs = [doc_terms(s) for s in pool]
+    lens = [sum(d.values()) for d in docs]
+    avg = sum(lens) / len(lens)
+    N = len(docs)
+    q = query_terms(query, aliases or {})
+    k1, b = 1.2, 0.75
+    scored = []
+    for s, d, L in zip(pool, docs, lens):
+        score, hit = 0.0, []
+        for t in q:
+            tf = d.get(t)
+            if not tf:
+                continue
+            df = sum(1 for x in docs if t in x)
+            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+            score += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * L / avg))
+            hit.append(t)
+        if score > 0:
+            scored.append((round(score, 2), s, hit))
+    scored.sort(key=lambda x: (-x[0], x[1]["name"]))
+    return scored[:n]
+
+
+# ---------- lint ----------
+
+def age_days(date_str):
+    try:
+        return (dt.date.today() - dt.date.fromisoformat(date_str)).days
+    except ValueError:
+        return None
+
+
+def hygiene_hits(text):
+    out = []
+    for pat, why in HYGIENE:
+        for m in re.finditer(pat, text, re.I):
+            out.append((why, text[: m.start()].count("\n") + 1, m.group(0)[:60]))
+    return out
+
+
+def lint_skill(s, d):
+    errs, warns = [], []
+    meta, body = s["_meta"], s["_body"]
+    for k in REQUIRED:
+        if not meta.get(k):
+            errs.append(f"missing '{k}'")
+    if s["name"] and s["name"] != d.name:
+        errs.append(f"name '{s['name']}' must match folder '{d.name}'")
+    if s["name"] and not NAME_RE.match(s["name"]):
+        errs.append("name must be kebab-case (a-z, 0-9, -)")
+    if len(s["name"]) > 64:
+        errs.append("name longer than 64 characters")
+    n = len(s["description"])
+    if s["description"].startswith("One or two sentences"):
+        errs.append("description is still the template placeholder")
+    if s["description"] and not 60 <= n <= 500:
+        errs.append(f"description is {n} chars; keep it 60-500 (what it does + when to use it)")
+    if s["status"] and s["status"] not in STATUSES:
+        errs.append(f"status must be one of {sorted(STATUSES)}")
+    if s["last_verified"]:
+        age = age_days(s["last_verified"])
+        if age is None:
+            errs.append("last_verified must be YYYY-MM-DD")
+        elif age < 0:
+            errs.append("last_verified is in the future")
+        elif age > STALE_DAYS:
+            warns.append(f"stale: last verified {age} days ago")
+    for a in s["attack"]:
+        if not ATTACK_RE.match(a):
+            errs.append(f"attack id '{a}' should look like T1558 or T1558.003")
+    for sec in SECTIONS:
+        if not re.search(rf"^{re.escape(sec)}\b", body, re.M | re.I):
+            errs.append(f"missing section '{sec}'")
+    text = (s["description"] + "\n" + body)
+    hits = hygiene_hits(text)
+    for why, line, frag in hits:
+        warns.append(f"hygiene: {why} (line ~{line}: '{frag}')")
+    if hits and not meta.get("hygiene_ok"):
+        warns.append("QUARANTINED: search won't serve this skill until the hits are removed, or you "
+                     "read it and add 'hygiene_ok: <why it is fine>' to the frontmatter")
+    elif meta.get("hygiene_ok"):
+        warns.append(f"hygiene_ok set by hand: {meta['hygiene_ok']}")
+    for m in re.finditer(r"https?://([^\s)>\]'\"`]+)", text):
+        url = m.group(1).lower()
+        if not any(url.startswith(h) or url.startswith("www." + h) for h in URL_ALLOW):
+            warns.append(f"link to a host not on the allowlist: {url[:80]}")
+    extra = [p for p in d.iterdir() if p.is_dir() and p.name == "scripts" and any(p.iterdir())]
+    if extra:
+        warns.append("has scripts/: read every script before trusting this skill")
+    if s["origin"] and s["origin"] != "own" and "@" not in s["origin"]:
+        warns.append("borrowed skill: origin should pin a commit, e.g. owner/repo@<sha>")
+    return errs, warns
+
+
+def cmd_lint(root):
+    names, n_err, n_warn, count = {}, 0, 0, 0
+    for group, d, f in skill_files(root):
+        count += 1
+        rel = f.relative_to(root)
+        try:
+            s = load_skill(group, d, f, root)
+        except SkillError as e:
+            print(f"ERROR {rel}: {e}")
+            n_err += 1
+            continue
+        errs, warns = lint_skill(s, d)
+        if s["name"] in names:
+            errs.append(f"duplicate name, also in {names[s['name']]}")
+        names[s["name"]] = rel
+        for e in errs:
+            print(f"ERROR {rel}: {e}")
+        for w in warns:
+            print(f"warn  {rel}: {w}")
+        n_err += len(errs)
+        n_warn += len(warns)
+    print(f"{count} skills checked: {n_err} errors, {n_warn} warnings")
+    return 1 if n_err else 0
+
+
+# ---------- commands ----------
+
+def fmt_hit(i, score, s, show_path=True):
+    desc = s["description"]
+    if len(desc) > 170:
+        desc = desc[:167].rsplit(" ", 1)[0] + "..."
+    flags = [s["status"]]
+    age = age_days(s["last_verified"]) if s["last_verified"] else None
+    if age is not None and age > STALE_DAYS:
+        flags.append(f"STALE {age}d")
+    elif s["last_verified"]:
+        flags.append(f"verified {s['last_verified']}")
+    out = f"{i}. {s['name']}  ({s['group']}/{s['domain']}, {', '.join(flags)}, score {score})\n   {desc}"
+    if show_path:
+        out += f"\n   -> {s['path']}"
+    return out
+
+
+def cmd_search(root, args):
+    idx = get_index(root)
+    hits = search(idx, " ".join(args.query), args.group, args.n, load_aliases(root))
+    good = [h for h in hits if h[0] >= MIN_SCORE]
+    if args.json:
+        print(json.dumps([{"name": s["name"], "score": sc, "path": str(root / s["path"]),
+                           "matched": m, "status": s["status"]} for sc, s, m in good], indent=1))
+        return 0
+    if idx["broken"]:
+        print(f"(note: {len(idx['broken'])} skill file(s) unreadable; run `skills lint`)")
+    q = sum(1 for s in idx["skills"] if s.get("quarantined") and args.group in (None, s["group"]))
+    if q:
+        print(f"(note: {q} skill(s) quarantined for suspicious text and not searched; tell the user to run `skills lint`)")
+    if not good:
+        best = f" (best: {hits[0][1]['name']}, score {hits[0][0]})" if hits else ""
+        print(f"No library skill matches well{best}. Work without one, and say so;"
+              " suggest adding a skill if this will come up again.")
+        return 0
+    print(f"Library: {root}")
+    for i, (sc, s, _) in enumerate(good, 1):
+        print(fmt_hit(i, sc, s))
+    print("Read the best match with `skills show <name>`. Load at most two.")
+    return 0
+
+
+def cmd_show(root, name):
+    idx = get_index(root)
+    for s in idx["skills"]:
+        if s["name"] == name:
+            if s.get("quarantined"):
+                print(f"'{name}' is quarantined (suspicious text). Not shown. Ask the user to review it with `skills lint`.", file=sys.stderr)
+                return 3
+            path = root / s["path"]
+            print(f"# path: {path}\n# folder: {path.parent} (references/, scripts/, assets/ are relative to this)\n")
+            print(path.read_text(encoding="utf-8"))
+            return 0
+    print(f"No skill named '{name}'. Use `skills search`.", file=sys.stderr)
+    return 1
+
+
+def cmd_list(root, group):
+    idx = get_index(root)
+    rows = [s for s in idx["skills"] if group in (None, s["group"])]
+    for s in sorted(rows, key=lambda s: (s["group"], s["domain"], s["name"])):
+        flag = "  [QUARANTINED]" if s.get("quarantined") else ""
+        print(f"{s['group']:<10} {s['domain']:<18} {s['status']:<10} {s['name']}{flag}")
+    print(f"{len(rows)} skills")
+    return 0
+
+
+def cmd_new(root, group, name):
+    if not NAME_RE.match(name) or len(name) > 64:
+        print("name must be kebab-case, max 64 chars, e.g. detecting-kerberoasting", file=sys.stderr)
+        return 2
+    if not NAME_RE.match(group) or group in SKIP_DIRS:
+        print(f"bad group '{group}'", file=sys.stderr)
+        return 2
+    existing = {s["name"] for s in get_index(root)["skills"]}
+    if name in existing:
+        print(f"'{name}' already exists", file=sys.stderr)
+        return 1
+    d = root / group / name
+    d.mkdir(parents=True)
+    tpl = (root / "TEMPLATE.md").read_text(encoding="utf-8")
+    tpl = tpl.replace("{{name}}", name).replace("{{date}}", dt.date.today().isoformat())
+    (d / "SKILL.md").write_text(tpl, encoding="utf-8")
+    print(f"created {d / 'SKILL.md'} (status: draft). Fill it in, then run `skills lint`.")
+    return 0
+
+
+def cmd_test(root):
+    tests = root / "tests"
+    fixtures = tests / "fixtures"
+    idx = build_index(fixtures)
+    if idx["broken"]:
+        print("fixture errors:", *idx["broken"], sep="\n  ")
+        return 1
+    aliases = load_aliases(root)
+    fails, total = 0, 0
+    for line in (tests / "router-cases.tsv").read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        query, expect = parts[0], parts[1].strip()
+        group = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        total += 1
+        hits = [h for h in search(idx, query, group, 5, aliases) if h[0] >= MIN_SCORE]
+        names = [s["name"] for _, s, _ in hits]
+        if expect == "-":
+            ok = not names
+            got = names[0] if names else "(none)"
+        else:
+            ok = expect in names[:TOP_K_PASS]
+            got = ", ".join(f"{s['name']}={sc}" for sc, s, _ in hits[:3]) or "(none)"
+        if not ok:
+            fails += 1
+        print(f"{'PASS' if ok else 'FAIL'}  {query!r} -> want {expect}; got {got}")
+    print(f"{total - fails}/{total} passed")
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="skills", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", type=Path, default=LIB)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("search"); p.add_argument("query", nargs="+")
+    p.add_argument("--group"); p.add_argument("-n", type=int, default=5)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("show"); p.add_argument("name")
+    p = sub.add_parser("list"); p.add_argument("--group")
+    sub.add_parser("lint")
+    p = sub.add_parser("new"); p.add_argument("group"); p.add_argument("name")
+    sub.add_parser("test")
+    a = ap.parse_args()
+    root = a.root.resolve()
+    if a.cmd == "search":
+        return cmd_search(root, a)
+    if a.cmd == "show":
+        return cmd_show(root, a.name)
+    if a.cmd == "list":
+        return cmd_list(root, a.group)
+    if a.cmd == "lint":
+        return cmd_lint(root)
+    if a.cmd == "new":
+        return cmd_new(root, a.group, a.name)
+    if a.cmd == "test":
+        return cmd_test(root)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

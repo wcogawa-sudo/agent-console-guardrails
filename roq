@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""roq - read-only query gate between an AI agent and SIEM / EDR consoles.
+
+The only sanctioned way for the agent to talk to Elastic/Kibana and
+SentinelOne. It refuses anything that could change a console: unknown hosts,
+any method other than GET (plus a short list of POST endpoints that only
+search), and inputs that fail the sanity checks below. Keys come from
+Bitwarden Secrets Manager (`bws run`) and are never printed.
+Targets live in targets.json next to this script (see targets.example.json).
+
+  roq targets
+  roq <target> GET  <path> [--param k=v ...]          [--out FILE]
+  roq <target> POST <path> --data FILE|- [--param ...] [--out FILE]
+  roq <target> GET  <path> --dry-run                   (validate, don't send)
+
+Every request (sent or refused) is appended to the audit log, minus the key.
+"""
+import json, os, re, shlex, subprocess, sys, urllib.parse, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+AUDIT = os.path.expanduser("~/.local/state/roq/audit.jsonl")
+# Keyring entry holding the Bitwarden access token (secret-tool lookup service <S> account <A>).
+BWS_SERVICE = os.environ.get("ROQ_KEYRING_SERVICE", "bws")
+BWS_ACCOUNT = os.environ.get("ROQ_KEYRING_ACCOUNT", "roq")
+
+# Search-only POST endpoints. Everything else that isn't GET is refused.
+ES_POST = [r"^/([^/_][^/]*/)?_search$", r"^/([^/_][^/]*/)?_count$", r"^/([^/_][^/]*/)?_field_caps$",
+           r"^/([^/_][^/]*/)?_msearch$", r"^/([^/_][^/]*/)?_eql/search$", r"^/_search/scroll$",
+           r"^/_query$", r"^/_sql$", r"^/_security/user/_has_privileges$"]
+KIBANA_POST = [r"^/api/detection_engine/signals/search$",
+               r"^/api/reporting/generate/csv_searchsource$"]   # creates an export job only
+S1_POST = [r"^/web/api/v2\.1/dv/events/pq$", r"^/web/api/v2\.1/dv/init-query$",
+           r"^/web/api/v2\.1/users/api-token-details$"]
+# GETs that are still off-limits (secrets / credential material).
+GET_DENY = [r"/_security/api_key", r"/api/actions/connector", r"/_security/user(?!/_has_privileges)",
+            r"/web/api/v2\.1/users/generate-api-token", r"/web/api/v2\.1/.*passphrase"]
+# S1 paths that return client data: a siteIds pin is mandatory (MSSP console).
+S1_SITE_SCOPED = r"^/web/api/v2\.1/(dv|threats|agents|activities|cloud-detection|unified-alerts|threat-intelligence|exclusions|installed-applications)"
+
+# targets.json: {"<name>": {"base": "https://...", "secret": "<env var / bws secret name>",
+#   "auth": "ApiKey|ApiToken", "kind": "es|kibana|kibana-getonly|s1",
+#   "forbidden_sites": {"<site id>": "<why>"}}}   # optional, S1 only
+CONFIG = os.environ.get("ROQ_TARGETS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json"))
+def load_targets():
+    try:
+        with open(CONFIG) as fh: raw = json.load(fh)
+    except FileNotFoundError:
+        print(f"roq: no targets file at {CONFIG} - copy targets.example.json", file=sys.stderr); sys.exit(2)
+    for v in raw.values():
+        if isinstance(v.get("secret"), list): v["secret"] = tuple(v["secret"])
+    return raw
+TARGETS = load_targets()
+
+def die(msg, code=2):
+    print(f"roq: REFUSED: {msg}", file=sys.stderr); sys.exit(code)
+
+def audit(rec):
+    os.makedirs(os.path.dirname(AUDIT), exist_ok=True)
+    rec["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with open(AUDIT, "a") as fh: fh.write(json.dumps(rec) + "\n")
+
+def secret_name(secret):
+    """A target may list several accepted secret names; return the first one present."""
+    names = secret if isinstance(secret, tuple) else (secret,)
+    return next((n for n in names if os.environ.get(n)), names[0])
+
+def ensure_secret(secret):
+    """Re-exec under `bws run` so the key arrives as an env var we never print."""
+    names = secret if isinstance(secret, tuple) else (secret,)
+    if any(os.environ.get(n) for n in names): return
+    if os.environ.get("ROQ_REEXEC"): die(f"none of the secrets {names} are available from Bitwarden (check the secret name and project access)")
+    token = subprocess.run(["secret-tool", "lookup", "service", BWS_SERVICE, "account", BWS_ACCOUNT],
+                           capture_output=True, text=True).stdout
+    if not token: die("no Bitwarden access token in the keyring - store it with secret-tool")
+    env = dict(os.environ, BWS_ACCESS_TOKEN=token, ROQ_REEXEC="1")
+    # bws run hands the command to a shell, so quote it (paths may contain spaces).
+    os.execvpe("bws", ["bws", "run", "--", shlex.join([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])], env)
+
+FUTURE_KEYS = re.compile(r'"?(toDate|to|lte|lt|endTime|end)"?\s*[:=]\s*"?(\d{4}-\d{2}-\d{2}T[\d:.]+Z?|\d{13})')
+
+def check_times(text, problems):
+    now = datetime.now(timezone.utc)
+    for _, val in FUTURE_KEYS.findall(text):
+        try:
+            t = datetime.fromtimestamp(int(val) / 1000, timezone.utc) if val.isdigit() \
+                else datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if t.tzinfo is None: t = t.replace(tzinfo=timezone.utc)
+            if t > now: problems.append(f"time window ends in the future ({val}) - counts will be short; end at now or earlier")
+        except ValueError:
+            pass
+
+def check_powerquery(q, problems, warnings):
+    if re.search(r"\bNOT\s+(?!\()", q, re.I):
+        problems.append("PowerQuery `NOT expr` silently returns 0 rows - use `NOT (expr)` or `!=`")
+    if re.search(r"\bstartswith\b|in:subnet", q, re.I):
+        problems.append("PowerQuery `startswith` / `in:subnet` are unsupported and silently match nothing")
+    if re.search(r"contains\s+['\"]10\.", q, re.I):
+        warnings.append("`contains '10.'` also matches public IPs like 199.232.x.x - match private ranges explicitly")
+    if "estimate_distinct" in q:
+        warnings.append("estimate_distinct() is an estimator - verify reported figures against raw rows")
+    if re.search(r"\|\s*columns\b", q) and re.search(r"\|\s*limit\s+\d+", q):
+        warnings.append("`| columns` + low `limit` silently truncates - cross-check with `| group n = count()`")
+
+def validate(tname, t, method, path, params, body):
+    problems, warnings = [], []
+    if not path.startswith("/"): problems.append("path must start with /")
+    if ".." in path or "://" in path or re.search(r"%2e|%2f|%5c|\\", path, re.I):
+        problems.append("path may not contain '..', encoded dots/slashes, or a URL")
+    for pat in GET_DENY:
+        if re.search(pat, path): problems.append(f"{path} exposes credential material - not allowed")
+    if method == "GET":
+        if body is not None: problems.append("GET with a body isn't allowed - use the POST search endpoint")
+    elif method == "POST":
+        allowed = {"es": ES_POST, "kibana": KIBANA_POST, "s1": S1_POST, "kibana-getonly": []}[t["kind"]]
+        if not any(re.match(p, path) for p in allowed):
+            hint = " (this Kibana's proxy strips kbn-xsrf; search through its Elasticsearch target)" if t["kind"] == "kibana-getonly" else ""
+            problems.append(f"POST {path} is not a search-only endpoint on {tname}{hint}")
+        if body is None: problems.append("POST needs --data")
+    else:
+        problems.append(f"method {method} is never allowed - this tool is read-only")
+    if body is not None:
+        try: parsed = json.loads(body)
+        except json.JSONDecodeError as e: problems.append(f"--data is not valid JSON: {e}"); parsed = None
+    else:
+        parsed = None
+    text = (body or "") + " " + urllib.parse.urlencode(params)
+    check_times(text, problems)
+    if t["kind"] == "s1":
+        # Per-target site deny list: e.g. a client whose sites exist on two consoles but hold
+        # data on only one (the empty one would read as "clean").
+        for sid, why in t.get("forbidden_sites", {}).items():
+            if sid in text: problems.append(f"site {sid} may not be queried on {tname}: {why}")
+        if re.match(S1_SITE_SCOPED, path) and "siteIds" not in text:
+            problems.append("S1 is an MSSP console - pin the client with siteIds (param or body); site ids differ between prod and NFR")
+        if parsed and isinstance(parsed, dict) and "query" in parsed and isinstance(parsed["query"], str):
+            check_powerquery(parsed["query"], problems, warnings)
+    if t["kind"] in ("es", "kibana") and parsed is not None and path.endswith(("_search", "signals/search")):
+        if "@timestamp" not in body and "range" not in body:
+            warnings.append("no time range in the query - results span all retained data")
+        if isinstance(parsed, dict) and isinstance(parsed.get("size"), int) and parsed["size"] > 10000:
+            problems.append("size > 10000 - page with search_after / scroll instead")
+    return problems, warnings
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"): print(__doc__); return
+    if a[0] == "targets":
+        for k, v in TARGETS.items():
+            sec = "/".join(v['secret']) if isinstance(v['secret'], tuple) else v['secret']
+            print(f"{k:16} {v['base']:50} secret={sec}  ({v['kind']})")
+        return
+    if len(a) < 3: die("usage: roq <target> <GET|POST> <path> [--data FILE|-] [--param k=v] [--out FILE] [--dry-run]")
+    tname, method, path, rest = a[0], a[1].upper(), a[2], a[3:]
+    t = TARGETS.get(tname) or die(f"unknown target {tname!r} (roq targets)")
+    params, body, out, dry = [], None, None, False
+    i = 0
+    while i < len(rest):
+        f = rest[i]
+        if f == "--param": k, _, v = rest[i + 1].partition("="); params.append((k, v)); i += 2
+        elif f == "--data": src = rest[i + 1]; body = sys.stdin.read() if src == "-" else open(src).read(); i += 2
+        elif f == "--out": out = rest[i + 1]; i += 2
+        elif f == "--dry-run": dry = True; i += 1
+        else: die(f"unknown option {f}")
+    if "?" in path:
+        path, _, qs = path.partition("?"); params = urllib.parse.parse_qsl(qs) + params
+    problems, warnings = validate(tname, t, method, path, params, body)
+    rec = dict(target=tname, method=method, path=path, params=params, body=body)
+    for w in warnings: print(f"roq: warning: {w}", file=sys.stderr)
+    if problems:
+        audit({**rec, "result": "refused", "problems": problems})
+        die("\n  - " + "\n  - ".join(problems))
+    if dry:
+        audit({**rec, "result": "dry-run"}); print("roq: dry-run OK - request passes all checks", file=sys.stderr); return
+    ensure_secret(t["secret"])
+    url = t["base"] + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    # Strip stray whitespace/newlines pasted into Bitwarden; never echo the value.
+    sname = secret_name(t["secret"])
+    key = os.environ[sname].strip()
+    if not key or any(c.isspace() for c in key):
+        die(f"secret {sname} contains whitespace inside it - fix the value in Bitwarden")
+    if t["kind"] == "s1" and re.fullmatch(r"[0-9a-fA-F-]{36}", key):
+        die(f"secret {sname} holds a 36-char ID, not an S1 API token (tokens are long and start with 'eyJ') - paste the generated token")
+    headers = {"Authorization": f"{t['auth']} {key}", "Accept": "application/json"}
+    if body is not None: headers["Content-Type"] = "application/json"
+    if t["kind"].startswith("kibana"): headers["kbn-xsrf"] = "true"
+    req = urllib.request.Request(url, data=body.encode() if body is not None else None, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r: status, data = r.status, r.read()
+    except urllib.error.HTTPError as e: status, data = e.code, e.read()
+    except urllib.error.URLError as e: audit({**rec, "result": "network-error", "error": str(e.reason)}); die(f"network error: {e.reason}", 3)
+    except Exception as e:
+        # Messages from the HTTP layer can quote request headers (and so the key): print the type only.
+        audit({**rec, "result": "client-error", "error": type(e).__name__}); die(f"request failed ({type(e).__name__}); details suppressed so the key can't leak", 3)
+    audit({**rec, "result": status, "bytes": len(data)})
+    if out:
+        with open(out, "wb") as fh: fh.write(data)
+        print(f"roq: HTTP {status}, {len(data)} bytes -> {out}", file=sys.stderr)
+    else:
+        sys.stdout.buffer.write(data); sys.stdout.write("\n")
+    if status >= 400: print(f"roq: HTTP {status}", file=sys.stderr); sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Router entry point: searches only the "security" group of the shared library.
+#   search <words...> [-n N]     ranked matches
+#   search --show <name>         print one skill
+# Resolves its real location, so it works through a symlink in ~/.claude/skills.
+set -euo pipefail
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+skills="$here/../skill-library/bin/skills"
+if [[ "${1:-}" == "--show" ]]; then
+  exec "$skills" show "${2:?usage: search --show <name>}"
+fi
+exec "$skills" search --group security "$@"

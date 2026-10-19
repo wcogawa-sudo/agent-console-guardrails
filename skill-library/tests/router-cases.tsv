@@ -1,0 +1,27 @@
+# query<TAB>expected skill (or - for "no match")<TAB>optional group
+# Run with: skills test   (searches tests/fixtures, not the real library)
+# Phrase queries the way you'd actually ask, not with the skill's own words.
+how do I check for kerberoasting in elastic	detecting-kerberoasting	security
+someone requesting lots of service tickets with RC4	detecting-kerberoasting	security
+T1558	detecting-kerberoasting	security
+atera agent found on a laptop, is it legit	triaging-remote-access-tools	security
+anydesk installed on one host	triaging-remote-access-tools	security
+S1 threat says tacticalagent is malicious	triaging-remote-access-tools	security
+certutil connecting to the internet	hunting-lolbin-downloads	security
+mshta downloading a payload	hunting-lolbin-downloads	security
+S1 driver blocking alert on MSI Center	investigating-vulnerable-driver-blocks	security
+byovd edr killer	investigating-vulnerable-driver-blocks	security
+crypto miner spreading over file shares	responding-to-coinminer	security
+my deep visibility query only returns 1000 groups	hunting-sentinelone-powerquery	security
+pq query returns zero	hunting-sentinelone-powerquery	security
+test purple AI for prompt injection	assessing-prompt-injection	security
+check this downloaded skill for injected instructions	assessing-prompt-injection	security
+user double clicked a .js file from a zip	hardening-script-file-associations	security
+zeek dropping packets	analysing-zeek-capture-loss	security
+mic too quiet in teams	fixing-pipewire-mic-gain	home
+change wallpaper when theme changes	binding-wallpaper-to-theme	home
+# group filter: home questions must not leak into the security router
+mic too quiet in teams	-	security
+# nothing relevant: must return no match rather than a random skill
+bake sourdough bread	-	security
+what is the weather tomorrow	-	security

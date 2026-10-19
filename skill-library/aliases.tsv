@@ -1,0 +1,34 @@
+# Query word<TAB>extra words to search for. Lets short or slang terms find the right skill.
+# Lowercase. Multi-word keys work ("deep visibility"). Add a line whenever a search misses
+# because you used a different word than the skill does.
+s1	sentinelone
+deep visibility	sentinelone powerquery
+dv	sentinelone powerquery
+pq	powerquery sentinelone
+kibana	elastic
+es	elastic elasticsearch
+esql	elastic
+kerberoast	kerberoasting t1558.003
+kerberoasting	t1558.003
+asrep	t1558.004 kerberos
+rmm	remote monitoring management remote-access
+anydesk	rmm remote-access
+atera	rmm remote-access
+splashtop	rmm remote-access
+teamviewer	rmm remote-access
+byovd	vulnerable driver t1068
+miner	coinminer cryptominer t1496
+cryptominer	coinminer t1496
+lolbin	lolbas living off the land
+lolbins	lolbas living off the land
+certutil	lolbas t1105
+ransomware	t1486 encryption
+phish	phishing t1566
+mimikatz	credential dumping lsass t1003
+lsass	credential dumping t1003
+dcsync	t1003.006 replication
+ir	incident response
+pw	pipewire audio
+mic	microphone pipewire audio
+hypr	hyprland
+wifi	wireless
